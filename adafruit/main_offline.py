@@ -12,7 +12,7 @@ State machine:
   PRIME      -> pump 3 s, then 5 s CH0 burst -> average -> log
   EXPERIMENT -> PI cooling loop @ setpoint 17 C on peltier PWM;
                 every 15 min pump 1 s then 5 s CH0 burst -> log;
-                button press -> machine.reset() (back to BOOT; logs overwritten)
+                button press -> machine.reset() (back to BOOT; new log files per session)
 
 Already on device: oled_display.py, ssd1306.py, LTR329.py, thermistor.py,
 button.py, sensor_config.py, config.py.
@@ -75,9 +75,11 @@ def screen(*lines):
 def pump_and_measure(pump_seconds, light_log):
     """Run pump, then average CH0 over CH0_BURST_S, log locally."""
     pump.value(1)
-    screen("PUMP ON", "{} s".format(pump_seconds))
-    time.sleep(pump_seconds)
-    pump.value(0)
+    try:
+        screen("PUMP ON", "{} s".format(pump_seconds))
+        time.sleep(pump_seconds)
+    finally:
+        pump.value(0)
 
     screen("MEASURING CH0", "{} s window".format(CH0_BURST_S))
     light.active(True)                       # keep sensor awake across the burst
@@ -197,10 +199,21 @@ def stop_and_reset(temp_log, light_log, reason="button press"):
     screen("STOPPED", reason[:16], "power cycling...")
     print("stopping:", reason)
     time.sleep(1)
-    reset()                                  # reruns main.py -> BOOT; logs reopened 'w'
+    reset()                                  # reruns main.py -> BOOT; new log files created
 
 
 # --- Boot / orchestration ----------------------------------------------------
+def next_log_path(name):
+    import os
+    stem, extension = name.rsplit(".", 1)
+    existing = set(os.listdir())
+    for number in range(1, 1000000):
+        candidate = "{}_{}.{}".format(stem, number, extension)
+        if candidate not in existing:
+            return candidate
+    raise OSError("no available log filename")
+
+
 def main():
     global pwm, pump, therm, light
 
@@ -244,10 +257,10 @@ def main():
     # WAIT 2
     btn.wait_for_press()
 
-    # Logs (overwrite each power cycle)
-    temp_log = open(TEMP_LOG_FILE, "w")
+    # Logs use a new filename each power cycle
+    temp_log = open(next_log_path(TEMP_LOG_FILE), "w")
     temp_log.write("time_s,temp_C,pwm_pct,error\n")
-    light_log = open(LIGHT_LOG_FILE, "w")
+    light_log = open(next_log_path(LIGHT_LOG_FILE), "w")
     light_log.write("time_s,ch0_avg,n_samples\n")
 
     # PRIME -> EXPERIMENT

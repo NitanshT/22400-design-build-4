@@ -1,0 +1,5 @@
+# Copy to config.py on the ESP32; never commit real credentials.
+WIFI_SSID = "YOUR_WIFI_SSID"
+WIFI_PASS = "YOUR_WIFI_PASSWORD"
+AIO_USER = "YOUR_ADAFRUIT_IO_USERNAME"
+AIO_KEY = "YOUR_ADAFRUIT_IO_KEY"

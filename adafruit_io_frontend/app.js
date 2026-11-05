@@ -122,6 +122,7 @@ const HIDDEN_TREND_SENSOR_IDS = new Set([
 ]);
 
 let refreshTimer = null;
+let refreshInFlight = false;
 let latestSettings = null;
 let experimentTimer = null;
 let experimentStartTime = null;
@@ -135,6 +136,7 @@ const elements = {
   form: document.getElementById("settings-form"),
   username: document.getElementById("username"),
   aioKey: document.getElementById("aio-key"),
+  rememberAioKey: document.getElementById("remember-aio-key"),
   settingsToggle: document.getElementById("settings-toggle"),
   advancedSettings: document.getElementById("advanced-settings-fields"),
   limit: document.getElementById("limit"),
@@ -300,6 +302,7 @@ function getSettingsFromForm() {
 function setFormFromSettings(settings = {}) {
   elements.username.value = settings.username || "";
   elements.aioKey.value = settings.aioKey || "";
+  elements.rememberAioKey.checked = settings.rememberAioKey === true;
   elements.limit.value = settings.limit || 120;
   elements.refreshSeconds.value = settings.refreshSeconds || 15;
 
@@ -358,8 +361,11 @@ function getExperimentNotes() {
 }
 
 function saveSettings() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(getSettingsFromForm()));
-  setStatus("ok", "Settings saved locally");
+  const settings = getSettingsFromForm();
+  settings.rememberAioKey = elements.rememberAioKey.checked;
+  if (!settings.rememberAioKey) delete settings.aioKey;
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+  setStatus("ok", settings.rememberAioKey ? "Settings and AIO key saved locally" : "Settings saved; AIO key remains in memory");
 }
 
 function loadSettings() {
@@ -370,7 +376,15 @@ function loadSettings() {
   }
 
   try {
-    setFormFromSettings(JSON.parse(raw));
+    const settings = JSON.parse(raw);
+    if (settings.aioKey && settings.rememberAioKey !== true) {
+      delete settings.aioKey;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+      setFormFromSettings(settings);
+      setStatus("idle", "Previously stored AIO key removed; enter it again to connect");
+    } else {
+      setFormFromSettings(settings);
+    }
   } catch {
     localStorage.removeItem(STORAGE_KEY);
     setFormFromSettings();
@@ -527,6 +541,7 @@ function createActiveExperimentSession() {
       stopped: null,
     },
     samples: {},
+    recordingGaps: [],
   };
 }
 
@@ -810,6 +825,12 @@ function buildCsvRowsFromSession(session) {
     .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
 }
 
+function csvCell(value, numeric = false) {
+  let text = String(value ?? "");
+  if (!numeric && /^[\s\x00-\x1f]*[=+@-]/.test(text)) text = "'" + text;
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
 function exportLatestCsv() {
   const session = getSessionForExport();
 
@@ -825,7 +846,7 @@ function exportLatestCsv() {
   const header = ["experiment_name", "started_at", "stopped_at", "feed", "label", "unit", "timestamp", "value"];
   const lines = [
     header.join(","),
-    ...rows.map((row) => header.map((column) => `"${String(row[column] ?? "").replace(/"/g, '""')}"`).join(",")),
+    ...rows.map((row) => header.map((column) => csvCell(row[column], column === "value")).join(",")),
   ];
 
   downloadTextFile(`${getExportFileStem(session)}-latest.csv`, `${lines.join("\n")}\n`, "text/csv;charset=utf-8");
@@ -1257,6 +1278,9 @@ function startExperiment() {
 }
 
 function stopExperiment() {
+  if (refreshInFlight && activeExperimentSession && !activeExperimentSession.stoppedAt) {
+    activeExperimentSession.recordingGaps.push({ at: new Date().toISOString(), feeds: [], reason: "recording stopped during a poll; final samples may be missing" });
+  }
   stopExperimentClock();
   const session = finalizeActiveExperimentSession();
 
@@ -1268,9 +1292,12 @@ function stopExperiment() {
 }
 
 async function refreshData() {
-  if (!latestSettings) return;
-
-  const activeSensors = getActiveSensors(latestSettings);
+  if (!latestSettings || refreshInFlight) return;
+  refreshInFlight = true;
+  const pollSettings = latestSettings;
+  const pollSession = activeExperimentSession;
+  try {
+  const activeSensors = getActiveSensors(pollSettings);
   if (!activeSensors.length) {
     setStatus("error", "No feed keys configured");
     return;
@@ -1280,25 +1307,36 @@ async function refreshData() {
 
   const results = await Promise.all(activeSensors.map(async (sensor) => {
     try {
-      return await fetchFeedData(latestSettings, sensor);
+      return await fetchFeedData(pollSettings, sensor);
     } catch (error) {
       return { sensor, points: [], error };
     }
   }));
 
+  if (pollSettings !== latestSettings) return;
   latestResults = results;
 
-  addResultsToActiveExperimentSession(results);
+  if (pollSession === activeExperimentSession) addResultsToActiveExperimentSession(results);
   renderSummary(results);
   renderCharts(results);
   renderSensorCards(results);
   renderTable(results);
 
   const errors = results.filter((result) => result.error).length;
+  if (pollSession && pollSession === activeExperimentSession) {
+    const failed = results.filter((r) => r.error).map((r) => r.sensor.feedKey);
+    const truncated = results.filter((r) => !r.error && r.points.length >= pollSettings.limit).map((r) => r.sensor.feedKey);
+    if (failed.length) pollSession.recordingGaps.push({ at: new Date().toISOString(), feeds: failed, reason: "poll failed; samples may be missing" });
+    if (truncated.length) pollSession.recordingGaps.push({ at: new Date().toISOString(), feeds: truncated, reason: "feed response reached the history limit; samples may be missing" });
+  }
   if (errors > 0) {
-    setStatus("error", `${errors} feed(s) failed. Check feed keys or AIO key.`);
+    setStatus("error", `${errors} feed(s) failed. Recording may have gaps; check feed keys or AIO key.`);
   } else {
-    setStatus("ok", `Connected to ${results.length} numeric feed(s)`);
+    const gaps = activeExperimentSession?.recordingGaps?.length || 0;
+    setStatus(gaps ? "error" : "ok", `Connected to ${results.length} numeric feed(s)${gaps ? `; ${gaps} potential recording gap(s)` : ""}`);
+  }
+  } finally {
+    refreshInFlight = false;
   }
 }
 
@@ -1333,6 +1371,22 @@ elements.form.addEventListener("submit", (event) => {
   startAutoRefresh(settings);
 });
 
+elements.rememberAioKey.addEventListener("change", () => {
+  if (!elements.rememberAioKey.checked) {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) {
+      try {
+        const saved = JSON.parse(raw);
+        delete saved.aioKey;
+        saved.rememberAioKey = false;
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(saved));
+        setStatus("idle", "Stored AIO key removed; current key remains in memory");
+      } catch {
+        localStorage.removeItem(STORAGE_KEY);
+      }
+    }
+  }
+});
 elements.saveSettings.addEventListener("click", saveSettings);
 elements.clearSettings.addEventListener("click", clearSettings);
 elements.refreshNow.addEventListener("click", refreshData);
@@ -1394,11 +1448,11 @@ if (elements.testDurationSlider && elements.testDurationValue) {
   syncControlPair(elements.testDurationSlider, elements.testDurationValue, elements.testDurationDisplay, (value) => String(Math.round(Number(value))));
 }
 
+setStatus("idle", "Enter feed settings and connect");
 loadSettings();
 loadSettingsPanelState();
 updateSystemEnableDisplay();
 renderStoredSnapshots();
-setStatus("idle", "Enter feed settings and connect");
 renderSummary([]);
 renderCharts([]);
 renderSensorCards([]);
