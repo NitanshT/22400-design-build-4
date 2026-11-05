@@ -98,9 +98,21 @@ def as_text(value):
 
 
 def as_bool(value):
-    return as_text(value).lower() in (
-        "1", "on", "true", "yes", "enable", "enabled"
-    )
+    value = as_text(value).lower()
+    if value in ("1", "on", "true", "yes", "enable", "enabled"):
+        return True
+    if value in ("0", "off", "false", "no", "disable", "disabled"):
+        return False
+    raise ValueError("invalid boolean")
+
+
+def command_number(value, low, high, integer=False):
+    number = float(value)
+    if (number != number or number == float("inf") or number == -float("inf")) or not low <= number <= high:
+        raise ValueError("command outside valid range")
+    if integer and number != int(number):
+        raise ValueError("integer required")
+    return int(number) if integer else number
 
 
 def elapsed_test_s():
@@ -126,8 +138,6 @@ def screen(*lines):
 def wifi_connect():
     wlan = _wlan
 
-    print("SSID repr:", repr(WIFI_SSID))
-    print("PASS len:", len(WIFI_PASS))
 
     if not wlan.active():
         wlan.active(True)
@@ -315,6 +325,7 @@ def mqtt_connect():
     time.sleep(2)
 
     for attempt in range(1, 6):
+        candidate = None
         try:
             wifi_connect()
             gc.collect()
@@ -338,11 +349,9 @@ def mqtt_connect():
             client = candidate
 
             for feed in control_feeds():
-                try:
-                    client.subscribe(base + feed)
-                    print("sub", feed)
-                except Exception as exc:
-                    print("sub err", feed, exc)
+                # All control subscriptions are required before reporting readiness.
+                client.subscribe(base + feed)
+                print("sub", feed)
 
             _pub_pause_until_ms = None
             print("mqtt connected")
@@ -352,8 +361,8 @@ def mqtt_connect():
             last_exc = exc
             print("mqtt connect err attempt", attempt, exc)
             try:
-                if client is not None:
-                    client.disconnect()
+                if candidate is not None:
+                    candidate.disconnect()
             except Exception:
                 pass
             client = None
@@ -420,13 +429,19 @@ def publish(feed, value):
 
 
 def check_controls():
+    global _pub_pause_until_ms
     if client is None:
+        if _pub_pause_until_ms is not None and utime.ticks_diff(utime.ticks_ms(), _pub_pause_until_ms) < 0:
+            return
+        if not _try_reconnect():
+            _pub_pause_until_ms = utime.ticks_add(utime.ticks_ms(), RECONNECT_BACKOFF_S * 1000)
         return
     try:
         client.check_msg()
     except Exception as exc:
         print("mqtt check err:", exc)
-        _try_reconnect()
+        if not _try_reconnect():
+            _pub_pause_until_ms = utime.ticks_add(utime.ticks_ms(), RECONNECT_BACKOFF_S * 1000)
 
 
 def publish_status(force=False, output=None):
@@ -505,7 +520,7 @@ def on_message(topic, msg):
 
     try:
         if feed == FEED_SETPOINT_TEMP:
-            state["setpoint_temp"] = clamp(float(msg_s), 10.0, 30.0)
+            state["setpoint_temp"] = command_number(msg_s, 10.0, 30.0)
 
         elif feed == FEED_SYSTEM_ENABLE:
             requested = as_bool(msg_s)
@@ -520,12 +535,12 @@ def on_message(topic, msg):
                 publish_status(force=True, output=0.0)
 
         elif feed == FEED_TEST_NUMBER:
-            state["test_number"] = max(1, int(float(msg_s)))
+            state["test_number"] = command_number(msg_s, 1, 1000000, integer=True)
             state["test_start_s"] = time.time()
             publish(feed_name("FEED_ELAPSED_TEST_S", "elapsed-test-s"), 0)
 
         elif feed == FEED_TEST_DURATION_S:
-            state["test_duration_s"] = max(0, int(float(msg_s)))
+            state["test_duration_s"] = command_number(msg_s, 0, 86400, integer=True)
 
         elif feed == FEED_SYSTEM_RESET:
             if as_bool(msg_s):
@@ -569,12 +584,12 @@ def pump_and_measure(pump_seconds, light_log):
 
     print("PUMP DEBUG: ON at", time.time())
     pump.value(1)
-    screen("PUMP ON", "{} s".format(pump_seconds))
-    if not wait_with_controls(pump_seconds):
+    try:
+        screen("PUMP ON", "{} s".format(pump_seconds))
+        if not wait_with_controls(pump_seconds):
+            return False
+    finally:
         pump.value(0)
-        print("PUMP DEBUG: OFF early at", time.time())
-        return False
-    pump.value(0)
     print("PUMP DEBUG: OFF at", time.time())
     
     screen("MEASURING CH0", "{} s".format(CH0_BURST_S))
@@ -627,9 +642,10 @@ def pump_and_measure(pump_seconds, light_log):
     return True
 
 
-def pi_step(temperature):
+def pi_step(temperature, dt=None):
     global _integral
-    dt = CONTROL_PERIOD_MS / 1000.0
+    if dt is None:
+        dt = CONTROL_PERIOD_MS / 1000.0
     error = temperature - state["setpoint_temp"]
     unclamped = cfg.Kp * error + cfg.Ki * (_integral + error * dt)
     output = max(0.0, min(1.0, unclamped))
@@ -712,6 +728,7 @@ def experiment_loop(temp_log, light_log):
     consec_errors = 0
     flush_count = 0
     last_pump_ms = utime.ticks_ms()
+    last_control_ms = None
 
     while state["system_enabled"]:
         loop_start = utime.ticks_ms()
@@ -733,7 +750,13 @@ def experiment_loop(temp_log, light_log):
             if not (MIN_VALID_TEMP_C <= temp <= MAX_VALID_TEMP_C):
                 raise ValueError("temp {} out of range".format(temp))
 
-            output, error = pi_step(temp)
+            now = utime.ticks_ms()
+            dt = CONTROL_PERIOD_MS / 1000.0 if last_control_ms is None else utime.ticks_diff(now, last_control_ms) / 1000.0
+            last_control_ms = now
+            if dt > 2 * CONTROL_PERIOD_MS / 1000.0 or dt <= 0:
+                print("missed control period; integral held, elapsed s:", dt)
+                dt = 0
+            output, error = pi_step(temp, dt)
             set_pwm(output)
             consec_errors = 0
         except Exception as exc:
@@ -834,11 +857,11 @@ def run_session():
         return
 
     try:
-        temp_log = open(TEMP_LOG_FILE, "w")
+        temp_log = open(next_log_path(TEMP_LOG_FILE), "w")
         temp_log.write(
             "time_s,temp_C,pwm_pct,error,setpoint_C,test_number,elapsed_test_s\n"
         )
-        light_log = open(LIGHT_LOG_FILE, "w")
+        light_log = open(next_log_path(LIGHT_LOG_FILE), "w")
         light_log.write("time_s,ch0_avg,n_samples,od_estimate\n")
 
         if state["run_needs_prime"]:
@@ -852,6 +875,17 @@ def run_session():
         handle_fault(exc)
     finally:
         close_logs(temp_log, light_log)
+
+
+def next_log_path(name):
+    import os
+    stem, extension = name.rsplit(".", 1)
+    existing = set(os.listdir())
+    for number in range(1, 1000000):
+        candidate = "{}_{}.{}".format(stem, number, extension)
+        if candidate not in existing:
+            return candidate
+    raise OSError("no available log filename")
 
 
 def main():
